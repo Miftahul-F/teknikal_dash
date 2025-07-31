@@ -8,7 +8,7 @@ st.title("📊 Apakah Saham Ini Layak Dibeli atau Dijual?")
 
 ticker = st.text_input("Masukkan kode saham (misal: BRMS.JK)", "BRMS.JK")
 
-# Ambil data
+# Ambil data harga
 try:
     data = yf.download(ticker, period="3mo", interval="1d", auto_adjust=True)
     if data.empty:
@@ -21,8 +21,8 @@ except Exception as e:
 data.dropna(inplace=True)
 data.reset_index(inplace=True)
 
-# Hitung indikator
-close = data['Close']
+# Pastikan data close adalah Series 1D
+close = data['Close'].squeeze()
 volume = data['Volume']
 ma9 = close.rolling(window=9).mean()
 rsi = ta.momentum.RSIIndicator(close=close).rsi()
@@ -30,7 +30,7 @@ macd_obj = ta.trend.MACD(close=close)
 macd = macd_obj.macd()
 macd_signal = macd_obj.macd_signal()
 
-# Support / Resistance (pivot)
+# Hitung support/resistance pivot
 def calculate_pivot(df):
     high = df['High'].iloc[-1]
     low = df['Low'].iloc[-1]
@@ -42,7 +42,7 @@ def calculate_pivot(df):
 
 pivot, resistance, support = calculate_pivot(data)
 
-# Ambil nilai terbaru
+# Ambil nilai indikator terbaru
 last_close = float(close.iloc[-1])
 last_ma9 = float(ma9.iloc[-1])
 last_rsi = float(rsi.iloc[-1])
@@ -79,11 +79,12 @@ else:
     sinyal = "⏸️ HOLD / TUNGGU KONFIRMASI"
     alasan.append("Belum ada sinyal kuat berdasarkan indikator umum")
 
-# OUTPUT
-st.subheader(f"📅 Data Tanggal: {date}")
+# OUTPUT HASIL
+st.subheader(f"📅 Tanggal Data Terakhir: {date}")
 st.subheader(f"📈 Sinyal: {sinyal}")
 
 col1, col2 = st.columns(2)
+
 col1.markdown(f"""
 - **Harga Saat Ini**: `{round(last_close, 2)}`
 - **Harga Beli Ideal**: `{harga_beli}`
