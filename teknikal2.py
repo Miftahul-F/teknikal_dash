@@ -1,5 +1,5 @@
-# multi_timeframe_pro.py
-# Multi-Timeframe Stock Analyzer Pro (1 ticker, 4 tab timeframe)
+# multi_timeframe_pro_portofolio.py
+# Multi-Timeframe Stock Analyzer Pro (1 ticker, 4 tab timeframe + kalkulasi portofolio)
 
 import streamlit as st
 import yfinance as yf
@@ -16,10 +16,10 @@ st.title("📊 Multi-Timeframe Stock Analyzer Pro")
 with st.sidebar:
     st.markdown("## Pengaturan Analisis")
     ticker = st.text_input("Ticker (contoh: BBCA.JK atau AAPL)", value="BBCA.JK").upper().strip()
-    avg_buy = st.number_input("Avg Buy (opsional)", min_value=0.0, value=0.0, step=0.01)
-    lots = st.number_input("Jumlah lot", min_value=0, value=0, step=1)
+    avg_buy = st.number_input("Avg Buy (Rp per lembar)", min_value=0.0, value=0.0, step=0.01)
+    lots = st.number_input("Jumlah lot (1 lot = 100 lembar)", min_value=0, value=0, step=1)
     st.markdown("---")
-    st.markdown("💡 Tips: BEI gunakan .JK")
+    st.markdown("💡 Tips: BEI gunakan .JK di akhir kode saham")
 
 # Fungsi ambil data
 def get_data(ticker, period, interval):
@@ -59,6 +59,15 @@ def calc_trade_levels(df):
     tp = r1
     sl = s1
     return entry, tp, sl, pivot, r1, s1, atr
+
+# Hitung portofolio
+def calc_portfolio(avg_buy, lots, last_price):
+    shares = lots * 100
+    modal = avg_buy * shares
+    nilai_pasar = last_price * shares
+    laba_rugi = nilai_pasar - modal
+    persen = (laba_rugi / modal * 100) if modal > 0 else 0
+    return shares, modal, nilai_pasar, laba_rugi, persen
 
 # Gambar chart
 def plot_chart(df, entry, tp, sl, pivot, r1, s1):
@@ -109,6 +118,23 @@ for tf_name, (period, interval, tab) in timeframes.items():
             df = resample_4h(df)
         df = add_indicators(df)
         entry, tp, sl, pivot, r1, s1, atr = calc_trade_levels(df)
+        last_price = df['Close'].iloc[-1]
+
+        # Info teknikal
         st.markdown(f"**Entry:** {entry:.2f} | **TP:** {tp:.2f} | **SL:** {sl:.2f} | **ATR:** {atr:.2f}")
+
+        # Portofolio
+        shares, modal, nilai_pasar, laba_rugi, persen = calc_portfolio(avg_buy, lots, last_price)
+        if lots > 0 and avg_buy > 0:
+            status = "📈 UNTUNG" if laba_rugi > 0 else "📉 RUGI"
+            st.markdown(f"""
+            **Portofolio:**
+            - Lot: **{lots}** ({shares} lembar)
+            - Modal: Rp {modal:,.0f}
+            - Nilai pasar: Rp {nilai_pasar:,.0f}
+            - Laba/Rugi: Rp {laba_rugi:,.0f} ({persen:.2f}%)
+            - Status: **{status}**
+            """)
+
         fig = plot_chart(df, entry, tp, sl, pivot, r1, s1)
         st.plotly_chart(fig, use_container_width=True)
