@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 
 # ---------------- CONFIG ----------------
 st.set_page_config(page_title="📊 Multi-Timeframe Stock Analyzer", layout="wide")
-st.title("📊 Multi-Timeframe Stock Analyzer (Anti-Crash)")
+st.title("📊 Multi-Timeframe Stock Analyzer (Anti-Crash & Type-Safe)")
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
@@ -34,27 +34,45 @@ def download_data(ticker, period, interval):
         df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
         if df.empty:
             return None
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except:
+        df = df[["Open", "High", "Low", "Close", "Volume"]]
+        df.columns = [c.title() for c in df.columns]  # pastikan konsisten
+        return df
+    except Exception as e:
+        st.error(f"Gagal mengambil data: {e}")
         return None
 
 def resample_4h(df):
-    return df.resample("4H").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna()
+    try:
+        return df.resample("4H").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        }).dropna()
+    except:
+        return df
+
+def ensure_series_1d(data):
+    """Pastikan output selalu Series 1D"""
+    if isinstance(data, pd.DataFrame):
+        if data.shape[1] == 1:
+            return data.iloc[:, 0]
+        else:
+            return data.mean(axis=1)  # fallback kalau multi kolom
+    elif isinstance(data, pd.Series):
+        return data
+    else:
+        return pd.Series(np.array(data).flatten())
 
 def compute_indicators(df):
     if "Close" not in df.columns:
         st.error("Data tidak memiliki kolom Close.")
         st.stop()
 
-    # pastikan 1D Series dan numeric
+    # Pastikan semua kolom numeric & 1D
     for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+        df[col] = pd.to_numeric(ensure_series_1d(df[col]), errors="coerce").astype(float)
     df = df.dropna()
 
     if len(df) < 15:
@@ -63,8 +81,8 @@ def compute_indicators(df):
 
     df["MA9"] = df["Close"].rolling(9).mean()
 
-    # fix: pastikan RSI pakai Series 1D
-    close_series = df["Close"].squeeze()
+    # Fix RSI 1D
+    close_series = ensure_series_1d(df["Close"])
     df["RSI14"] = ta.momentum.RSIIndicator(close_series, window=14).rsi()
 
     macd_obj = ta.trend.MACD(close_series)
@@ -72,7 +90,10 @@ def compute_indicators(df):
     df["MACD_signal"] = macd_obj.macd_signal()
 
     df["ATR14"] = ta.volatility.AverageTrueRange(
-        df["High"], df["Low"], df["Close"], window=14
+        ensure_series_1d(df["High"]),
+        ensure_series_1d(df["Low"]),
+        close_series,
+        window=14
     ).average_true_range()
 
     df["VolMA20"] = df["Volume"].rolling(20).mean()
@@ -115,7 +136,6 @@ def rekomendasi(row):
 interval_map = {"1h": "60m", "4h": "60m", "Daily": "1d", "Weekly": "1wk"}
 df_raw = download_data(ticker, period, interval_map[timeframe])
 if df_raw is None:
-    st.error("Gagal mengambil data. Periksa ticker atau koneksi internet.")
     st.stop()
 
 if timeframe == "4h":
