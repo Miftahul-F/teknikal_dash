@@ -4,91 +4,111 @@ import numpy as np
 import yfinance as yf
 import ta
 
-# ----------------------------
-# Fungsi ambil data
-# ----------------------------
-def get_data(ticker, period="6mo", interval="1d"):
+# -----------------------------
+# Fungsi: Ambil Data Saham
+# -----------------------------
+def load_data(ticker, period="60d", interval="1d"):
     try:
-        data = yf.download(ticker, period=period, interval=interval)
-        if data.empty:
-            st.warning("Data kosong. Coba ticker, periode, atau interval lain.")
-            return pd.DataFrame()
-        data = data.dropna().reset_index()
-        return data
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            st.error("Data tidak ditemukan. Periksa ticker atau period.")
+            return None
+        df.reset_index(inplace=True)
+        return df
     except Exception as e:
         st.error(f"Gagal mengambil data: {e}")
-        return pd.DataFrame()
+        return None
 
-# ----------------------------
-# Fungsi hitung indikator
-# ----------------------------
+# -----------------------------
+# Fungsi: Hitung Indikator
+# -----------------------------
 def compute_indicators(df):
-    try:
-        # Pastikan kolom numerik
-        numeric_cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
-
-        # Hitung indikator
-        df["RSI14"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
-        df["SMA20"] = ta.trend.SMAIndicator(df["Close"], window=20).sma_indicator()
-        df["EMA20"] = ta.trend.EMAIndicator(df["Close"], window=20).ema_indicator()
-
-        macd = ta.trend.MACD(df["Close"])
-        df["MACD"] = macd.macd()
-        df["MACD_signal"] = macd.macd_signal()
-
-        return df
-    except Exception as e:
-        st.error(f"Error hitung indikator: {e}")
+    df = df.copy()
+    if 'Close' not in df.columns:
+        st.error("Data tidak memiliki kolom 'Close'.")
         return df
 
-# ----------------------------
-# Fungsi rekomendasi sederhana
-# ----------------------------
-def generate_signal(df):
-    if df.empty:
+    df["EMA20"] = ta.trend.ema_indicator(df["Close"], window=20)
+    df["EMA50"] = ta.trend.ema_indicator(df["Close"], window=50)
+    df["RSI14"] = ta.momentum.rsi(df["Close"], window=14)
+    macd = ta.trend.macd_diff(df["Close"])
+    df["MACD_diff"] = macd
+    return df
+
+# -----------------------------
+# Fungsi: Analisis Sinyal
+# -----------------------------
+def get_signal(df):
+    if df.empty or len(df) < 2:
         return "No Data"
+
     latest = df.iloc[-1]
-    if latest["RSI14"] < 30 and latest["MACD"] > latest["MACD_signal"]:
-        return "BUY"
-    elif latest["RSI14"] > 70 and latest["MACD"] < latest["MACD_signal"]:
-        return "SELL"
+    ema_signal = "Buy" if latest["EMA20"] > latest["EMA50"] else "Sell"
+    rsi_signal = "Overbought" if latest["RSI14"] > 70 else "Oversold" if latest["RSI14"] < 30 else "Neutral"
+
+    if ema_signal == "Buy" and rsi_signal != "Overbought":
+        return "Buy"
+    elif ema_signal == "Sell" and rsi_signal != "Oversold":
+        return "Sell"
     else:
-        return "HOLD"
+        return "Hold"
 
-# ----------------------------
+# -----------------------------
 # UI Streamlit
-# ----------------------------
-st.set_page_config(page_title="📊 Multi-Timeframe Stock Analyzer", layout="wide")
-st.title("📊 Multi-Timeframe Stock Analyzer")
+# -----------------------------
+st.set_page_config(page_title="Multi-Timeframe Stock Analyzer", layout="wide")
+st.title("📊 Multi-Timeframe Stock Analyzer (Pro Version)")
 
-with st.sidebar:
-    st.header("Input & Pengaturan")
-    ticker = st.text_input("Ticker (contoh: GOTO.JK / AAPL)", value="BBRI.JK")
-    period = st.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "5y"], index=2)
-    interval = st.selectbox("Timeframe", ["1h", "4h", "1d", "1wk"], index=2)
-    avg_buy = st.number_input("Avg Buy (Rp per lembar)", value=0.0, step=1.0)
-    lot = st.number_input("Jumlah Lot", value=0, step=1)
+col1, col2, col3 = st.columns(3)
+with col1:
+    ticker = st.text_input("Ticker (contoh: PWON.JK)", value="PWON.JK")
+with col2:
+    period = st.text_input("Period (misal: 60d / 1y)", value="60d")
+with col3:
+    avg_buy = st.number_input("Avg Buy (Rp per lembar)", min_value=0.0, value=0.0)
 
-if ticker:
-    df = get_data(ticker, period, interval)
+lot = st.number_input("Jumlah Lot", min_value=0, value=0)
 
-    if not df.empty:
-        df = compute_indicators(df)
-        st.subheader(f"📈 Data {ticker} - {interval}")
-        st.dataframe(df.tail())
+# -----------------------------
+# Ambil data multi-timeframe
+# -----------------------------
+timeframes = {
+    "1h": ("7d", "1h"),
+    "4h": ("60d", "4h"),
+    "Daily": (period, "1d"),
+    "Weekly": ("2y", "1wk")
+}
 
-        signal = generate_signal(df)
-        st.markdown(f"### 🔍 Rekomendasi: **{signal}**")
+results = {}
+for tf_name, (tf_period, tf_interval) in timeframes.items():
+    df_tf = load_data(ticker, tf_period, tf_interval)
+    if df_tf is not None:
+        df_tf = compute_indicators(df_tf)
+        signal = get_signal(df_tf)
+        results[tf_name] = (df_tf, signal)
 
-        # Hitung profit/loss jika input pembelian diisi
-        if avg_buy > 0 and lot > 0:
-            latest_price = df["Close"].iloc[-1]
-            invest_value = avg_buy * lot * 100
-            current_value = latest_price * lot * 100
-            pl = current_value - invest_value
-            st.metric("Profit/Loss", f"Rp {pl:,.0f}")
+# -----------------------------
+# Tampilkan hasil
+# -----------------------------
+st.subheader("📈 Hasil Analisis Multi-Timeframe")
+for tf_name, (df_tf, signal) in results.items():
+    latest_close = df_tf["Close"].iloc[-1]
+    st.markdown(f"**{tf_name}** — Harga Terakhir: Rp{latest_close:,.2f} — Sinyal: **{signal}**")
 
-        st.line_chart(df.set_index("Date")[["Close", "SMA20", "EMA20"]])
+# -----------------------------
+# Hitung keuntungan / kerugian
+# -----------------------------
+if avg_buy > 0 and lot > 0 and "Daily" in results:
+    last_price = results["Daily"][0]["Close"].iloc[-1]
+    profit_loss = (last_price - avg_buy) * lot * 100
+    st.subheader("💰 Kalkulasi Posisi")
+    st.write(f"Nilai Investasi: Rp {lot * 100 * avg_buy:,.0f}")
+    st.write(f"Nilai Sekarang: Rp {lot * 100 * last_price:,.0f}")
+    st.write(f"Profit / Loss: **Rp {profit_loss:,.0f}**")
+
+# -----------------------------
+# Tabel Dataframe
+# -----------------------------
+st.subheader("📄 Data Harga (Daily)")
+if "Daily" in results:
+    st.dataframe(results["Daily"][0].tail(20))
