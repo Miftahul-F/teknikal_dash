@@ -50,4 +50,14 @@ def plot_chart(df, title):
         low=df['Low'], close=df['Close'], name='Candles'
     ))
     fig.add_trace(go.Scatter(
-        x=df.index, y=df['MA9'], mode='lines', name='MA
+        x=df.index, y=df['MA9'], mode='lines', name='MA9', line=dict(color='orange')
+    ))
+    fig.update_layout(title=title, xaxis_rangeslider_visible=False)
+    return fig
+
+# ---------------------------
+# Deteksi sinyal dasar
+# ---------------------------
+def base_signal(df):
+    if df.empty:
+        return "Data
