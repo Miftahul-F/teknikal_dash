@@ -1,201 +1,147 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import ta
-from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 
-# ---------------- CONFIG ----------------
 st.set_page_config(page_title="📊 Multi-Timeframe Stock Analyzer", layout="wide")
-st.title("📊 Multi-Timeframe Stock Analyzer (Anti-Crash & Type-Safe)")
 
-# ---------------- SIDEBAR ----------------
-with st.sidebar:
-    st.markdown("## Input & Pengaturan")
-    ticker_input = st.text_input("Ticker (contoh: GOTO atau AAPL)", value="GOTO").upper().strip()
-    if not ticker_input.endswith(".JK") and len(ticker_input) <= 4:
-        ticker = ticker_input + ".JK"
-    else:
-        ticker = ticker_input
-
-    timeframe = st.selectbox("Timeframe", ["1h", "4h", "Daily", "Weekly"], index=2)
-    period_map = {"1h": "60d", "4h": "60d", "Daily": "1y", "Weekly": "5y"}
-    period = st.text_input("Period", value=period_map[timeframe])
-
-    st.markdown("---")
-    st.markdown("### Data Pembelian (opsional)")
-    avg_buy = st.number_input("Avg Buy (Rp per lembar)", min_value=0.0, step=0.01)
-    lots = st.number_input("Jumlah lot (1 lot = 100 lembar)", min_value=0, step=1)
-
-# ---------------- FUNCTIONS ----------------
+# ---------------- Fungsi Download Data ---------------- #
 def download_data(ticker, period, interval):
     try:
-        df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+        df = yf.download(
+            ticker, 
+            period=period, 
+            interval=interval, 
+            auto_adjust=True, 
+            progress=False
+        )
+
         if df.empty:
             return None
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        df.columns = [c.title() for c in df.columns]  # pastikan konsisten
+
+        # Kalau kolom MultiIndex (multi ticker), ambil ticker pertama
+        if isinstance(df.columns, pd.MultiIndex):
+            first_ticker = df.columns.levels[0][0]
+            df = df[first_ticker]
+
+        # Ambil kolom penting
+        keep_cols = ["Open", "High", "Low", "Close", "Volume"]
+        df = df[[col for col in keep_cols if col in df.columns]]
+
+        # Nama kolom jadi Title Case
+        df.columns = [str(c).title() for c in df.columns]
+
         return df
+
     except Exception as e:
         st.error(f"Gagal mengambil data: {e}")
         return None
 
-def resample_4h(df):
-    try:
-        return df.resample("4H").agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum"
-        }).dropna()
-    except:
-        return df
-
-def ensure_series_1d(data):
-    """Pastikan output selalu Series 1D"""
-    if isinstance(data, pd.DataFrame):
-        if data.shape[1] == 1:
-            return data.iloc[:, 0]
-        else:
-            return data.mean(axis=1)  # fallback kalau multi kolom
-    elif isinstance(data, pd.Series):
-        return data
-    else:
-        return pd.Series(np.array(data).flatten())
-
+# ---------------- Fungsi Hitung Indikator ---------------- #
 def compute_indicators(df):
-    if "Close" not in df.columns:
-        st.error("Data tidak memiliki kolom Close.")
+    if df is None or "Close" not in df.columns:
+        st.error("Data tidak valid untuk hitung indikator.")
         st.stop()
 
-    # Pastikan semua kolom numeric & 1D
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(ensure_series_1d(df[col]), errors="coerce").astype(float)
-    df = df.dropna()
+    # Pastikan semua kolom numeric
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna().copy()
 
     if len(df) < 15:
-        st.error("Data terlalu sedikit untuk menghitung indikator.")
+        st.error("Data terlalu sedikit untuk hitung indikator.")
         st.stop()
 
-    df["MA9"] = df["Close"].rolling(9).mean()
+    close = df["Close"]
 
-    # Fix RSI 1D
-    close_series = ensure_series_1d(df["Close"])
-    df["RSI14"] = ta.momentum.RSIIndicator(close_series, window=14).rsi()
-
-    macd_obj = ta.trend.MACD(close_series)
+    df["MA9"] = close.rolling(9).mean()
+    df["RSI14"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+    macd_obj = ta.trend.MACD(close)
     df["MACD"] = macd_obj.macd()
     df["MACD_signal"] = macd_obj.macd_signal()
-
     df["ATR14"] = ta.volatility.AverageTrueRange(
-        ensure_series_1d(df["High"]),
-        ensure_series_1d(df["Low"]),
-        close_series,
-        window=14
+        df["High"], df["Low"], close, window=14
     ).average_true_range()
-
     df["VolMA20"] = df["Volume"].rolling(20).mean()
 
     return df
 
-def pivot_levels(df):
-    h, l, c = df["High"].iloc[-1], df["Low"].iloc[-1], df["Close"].iloc[-1]
-    pivot = (h + l + c) / 3
-    r1 = (2 * pivot) - l
-    s1 = (2 * pivot) - h
-    r2 = pivot + (h - l)
-    s2 = pivot - (h - l)
-    return pivot, r1, r2, s1, s2
+# ---------------- Fungsi Rekomendasi ---------------- #
+def get_recommendation(df):
+    latest = df.iloc[-1]
+    if latest["Close"] > latest["MA9"] and latest["RSI14"] > 50 and latest["MACD"] > latest["MACD_signal"]:
+        return "BUY"
+    elif latest["Close"] < latest["MA9"] and latest["RSI14"] < 50 and latest["MACD"] < latest["MACD_signal"]:
+        return "SELL"
+    else:
+        return "HOLD"
 
-def entry_tp_sl(df):
-    pivot, r1, r2, s1, s2 = pivot_levels(df)
-    c = df["Close"].iloc[-1]
-    swing_res = df["High"].tail(10).max()
-    swing_sup = df["Low"].tail(10).min()
-    atr = df["ATR14"].iloc[-1] if not np.isnan(df["ATR14"].iloc[-1]) else c * 0.02
+# ---------------- Fungsi Plot ---------------- #
+def plot_chart(df, ticker):
+    fig = go.Figure()
 
-    entry = max([lvl for lvl in [df["MA9"].iloc[-1], pivot, s1, swing_sup] if lvl <= c], default=c * 0.99)
-    tp = min([lvl for lvl in [r1, r2, swing_res] if lvl >= c], default=c + 1.5 * atr)
-    sl = max([lvl for lvl in [s1, s2, swing_sup] if lvl <= c], default=c - 1.0 * atr)
-    return entry, tp, sl, (pivot, r1, r2, s1, s2, swing_res, swing_sup)
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="Candlestick"
+    ))
 
-def rekomendasi(row):
-    try:
-        if row["Close"] > row["MA9"] and row["RSI14"] < 70 and row["MACD"] > row["MACD_signal"]:
-            return "BUY"
-        elif row["Close"] < row["MA9"] and row["RSI14"] > 50 and row["MACD"] < row["MACD_signal"]:
-            return "SELL"
-        else:
-            return "HOLD"
-    except:
-        return "WAIT"
+    # MA9
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["MA9"], mode="lines", name="MA9", line=dict(color="orange")
+    ))
 
-# ---------------- FETCH DATA ----------------
-interval_map = {"1h": "60m", "4h": "60m", "Daily": "1d", "Weekly": "1wk"}
-df_raw = download_data(ticker, period, interval_map[timeframe])
-if df_raw is None:
-    st.stop()
+    fig.update_layout(
+        title=f"Chart {ticker}",
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        height=600
+    )
 
-if timeframe == "4h":
-    df = resample_4h(df_raw)
-else:
-    df = df_raw.copy()
+    st.plotly_chart(fig, use_container_width=True)
 
-df = compute_indicators(df)
+# ---------------- UI ---------------- #
+st.title("📊 Multi-Timeframe Stock Analyzer (1h / 4h / Daily / Weekly)")
 
-# ---------------- SUMMARY ----------------
-last = df.iloc[-1]
-entry, tp, sl, levels = entry_tp_sl(df)
-pivot, r1, r2, s1, s2, swing_res, swing_sup = levels
-rekomen = rekomendasi(last)
+ticker_input = st.text_input("Ticker (contoh: GOTO atau AAPL)").upper()
+timeframe = st.selectbox("Timeframe", ["1h", "4h", "1d", "1wk"])
+period = st.text_input("Period (misal: 60d / 1y / 5y)", "60d")
+avg_buy = st.number_input("Avg Buy (Rp per lembar)", value=0.0, step=0.01)
+lot = st.number_input("Jumlah Lot (1 lot = 100 lembar)", value=0, step=1)
 
-shares = lots * 100
-if avg_buy > 0 and shares > 0:
-    modal = avg_buy * shares
-    nilai_now = last["Close"] * shares
-    pnl = nilai_now - modal
-    pnl_pct = (pnl / modal) * 100
-else:
-    modal = nilai_now = pnl = pnl_pct = 0
+if ticker_input:
+    if not ticker_input.endswith(".JK") and ticker_input.isalpha() and len(ticker_input) <= 4:
+        ticker_input += ".JK"
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Ticker", ticker)
-col2.metric("Harga Sekarang", f"{last['Close']:.2f}")
-col3.metric("Rekomendasi", rekomen)
-col4.metric("Timeframe", timeframe)
+    df = download_data(ticker_input, period, "60m" if timeframe in ["1h", "4h"] else timeframe)
 
-st.markdown(f"**Entry**: {entry:.2f} • **TP**: {tp:.2f} • **SL**: {sl:.2f}")
-st.markdown(f"**Pivot | R1 | R2**: {pivot:.2f} | {r1:.2f} | {r2:.2f}")
-st.markdown(f"**Swing High(10)**: {swing_res:.2f} • **Swing Low(10)**: {swing_sup:.2f}")
-st.markdown(f"**ATR(14)**: {last['ATR14']:.2f} • **Volume**: {int(last['Volume'])} • **VolMA20**: {int(last['VolMA20']) if not np.isnan(last['VolMA20']) else '-'}")
+    if df is not None:
+        # Resample 4h
+        if timeframe == "4h":
+            df = df.resample("4H").agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum"
+            }).dropna()
 
-if shares > 0:
-    st.subheader("💼 Portofolio")
-    st.write(f"Qty: {shares} lembar • Modal: {modal:,.0f} • Nilai: {nilai_now:,.0f}")
-    st.write(f"P/L: {pnl:,.0f} • P/L %: {pnl_pct:.2f}%")
+        df = compute_indicators(df)
+        rec = get_recommendation(df)
 
-# ---------------- CHART ----------------
-fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.5, 0.12, 0.18, 0.18])
+        st.subheader(f"Rekomendasi: **{rec}**")
+        st.dataframe(df.tail(10))
 
-fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
-                             low=df["Low"], close=df["Close"], name="Harga"), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df["MA9"], mode="lines", name="MA9", line=dict(color="orange")), row=1, col=1)
+        plot_chart(df, ticker_input)
 
-for y, name, color in [(entry, "Entry", "#3498db"), (tp, "TP", "#2ecc71"), (sl, "SL", "#e74c3c")]:
-    fig.add_hline(y=y, line_dash="dot", line_color=color, annotation_text=name, row=1, col=1)
-
-fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color="lightblue"), row=2, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df["VolMA20"], mode="lines", name="VolMA20", line=dict(color="orange")), row=2, col=1)
-
-fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], mode="lines", name="RSI", line=dict(color="yellow")), row=3, col=1)
-fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
-fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
-
-fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], mode="lines", name="MACD", line=dict(color="cyan")), row=4, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], mode="lines", name="Signal", line=dict(color="magenta")), row=4, col=1)
-fig.add_hline(y=0, line_dash="dot", line_color="white", row=4, col=1)
-
-fig.update_layout(template="plotly_dark", height=900, showlegend=True, xaxis_rangeslider_visible=False)
-st.plotly_chart(fig, use_container_width=True)
+        # Hitung P/L jika input pembelian
+        if avg_buy > 0 and lot > 0:
+            last_price = df["Close"].iloc[-1]
+            total_buy = avg_buy * lot * 100
+            total_now = last_price * lot * 100
+            pl = total_now - total_buy
+            st.info(f"Last Price: Rp {last_price:,.2f} | P/L: Rp {pl:,.2f}")
