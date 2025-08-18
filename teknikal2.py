@@ -1,366 +1,267 @@
-# streamlit_multi_tf_pro_plus.py
-# Multi-Timeframe Stock Analyzer Pro+
-# - Auto .JK detection
-# - Cached & retry download
-# - Mode Hemat Bandwidth
-# - Tema chart (dark/light)
-# - Indikator manual (EMA/RSI/MACD)
-# - Pivot/Swing & Entry/TP/SL
-# - Rekomendasi per timeframe + Confidence Score (0–100)
-# - Risk Manager & P/L
+# streamlit_app.py — Multi-Timeframe Stock Analyzer Pro (final)
 
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
+import ta
 import plotly.graph_objects as go
-from datetime import timedelta
 
-# -----------------------------
-# UI Config
-# -----------------------------
-st.set_page_config(page_title="Stock Analyzer Pro+", layout="wide")
-st.title("📊 Multi-Timeframe Stock Analyzer Pro+")
-
-# -----------------------------
-# Helpers
-# -----------------------------
+# =========================
+# Utils & Normalizer
+# =========================
 def normalize_ticker(raw: str) -> str:
-    """Auto-append .JK untuk kode BEI yang tidak punya suffix."""
-    t = (raw or "").upper().strip()
-    if not t:
-        return t
-    # jika sudah ada '.', jangan tambahkan .JK (AAPL, TLKM.JK, dll)
-    if "." in t:
-        return t
-    # asumsi kode BEI umumnya 3–5 huruf
-    if 2 <= len(t) <= 5 and t.isalnum():
-        return t + ".JK"
-    return t
+    """Kalau user tidak menulis suffix, default-kan ke BEI (.JK)."""
+    s = (raw or "").strip().upper()
+    if not s:
+        return ""
+    return s if "." in s else f"{s}.JK"
 
-# -----------------------------
-# Indikator manual
-# -----------------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def ensure_numeric_1d(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex kolom yfinance & pastikan kolom OHLC numeric 1D."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    cols_need = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[cols_need].copy()
+    for c in cols_need:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Close"]).sort_index()
+    return df
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    r = 100 - (100 / (1 + rs))
-    return r.clip(0, 100)
+# =========================
+# Data Fetcher
+# =========================
+@st.cache_data(show_spinner=False, ttl=300)
+def get_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+        return ensure_numeric_1d(df)
+    except Exception as e:
+        st.error(f"Gagal mengambil data {ticker} ({period}/{interval}): {e}")
+        return pd.DataFrame()
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    macd_line = ema(series, fast) - ema(series, slow)
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
+# =========================
+# Indicators (aman)
+# =========================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    """Tambahkan MA9, RSI(14), MACD, Signal, ATR. Aman untuk data pendek."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume","MA9","RSI14","MACD","Signal","ATR"])
     out = df.copy()
-    out["EMA20"] = ema(out["Close"], 20)
-    out["EMA50"] = ema(out["Close"], 50)
-    out["RSI14"] = rsi(out["Close"], 14)
-    out["MACD"], out["MACDsig"], out["MACDhist"] = macd(out["Close"])
-    if "Volume" in out:
-        out["VolMA20"] = out["Volume"].rolling(20).mean()
-    return out.dropna()
 
-def trend_label(last: pd.Series) -> str:
-    return "🟢 Bullish" if last["EMA20"] > last["EMA50"] else "🔴 Bearish"
+    # Window aman — ta.* akan mengembalikan NaN di awal, pastikan 1D series
+    close = out["Close"]
+    high  = out["High"] if "High" in out else close
+    low   = out["Low"]  if "Low"  in out else close
 
-def rec_signal(last: pd.Series) -> str:
-    buy = (last["RSI14"] < 30) or ((last["EMA20"] > last["EMA50"]) and (last["MACD"] > last["MACDsig"]))
-    sell = (last["RSI14"] > 70) or ((last["EMA20"] < last["EMA50"]) and (last["MACD"] < last["MACDsig"]))
-    if buy:
-        return "✅ BUY"
-    if sell:
-        return "❌ SELL"
-    return "⚠️ HOLD"
+    # MA9
+    out["MA9"] = close.rolling(9, min_periods=1).mean()
 
-def confidence_score(d_last: pd.Series, w_last: pd.Series) -> int:
+    # RSI / MACD / ATR: bungkus try agar tetap aman jika data terlalu pendek
+    try:
+        out["RSI14"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+    except Exception:
+        out["RSI14"] = np.nan
+
+    try:
+        macd_obj = ta.trend.MACD(close=close)
+        out["MACD"] = macd_obj.macd()
+        out["Signal"] = macd_obj.macd_signal()
+    except Exception:
+        out["MACD"] = np.nan
+        out["Signal"] = np.nan
+
+    try:
+        atr_obj = ta.volatility.AverageTrueRange(high=high, low=low, close=close, window=14)
+        out["ATR"] = atr_obj.average_true_range()
+    except Exception:
+        out["ATR"] = np.nan
+
+    return out
+
+# =========================
+# Signals & Scoring
+# =========================
+def get_trend(df: pd.DataFrame) -> str:
+    """UP jika Close > MA9; else DOWN; jika data tak cukup -> '-'."""
+    if df is None or df.empty or "MA9" not in df:
+        return "-"
+    last = df.iloc[-1]
+    if pd.isna(last.get("MA9", np.nan)) or pd.isna(last.get("Close", np.nan)):
+        return "-"
+    return "UP" if last["Close"] > last["MA9"] else "DOWN"
+
+def has_entry_signal(df: pd.DataFrame) -> bool:
+    """Entry jika MACD cross-up & RSI > 50. Aman untuk data < 2 bar."""
+    if df is None or df.empty or "MACD" not in df or "Signal" not in df or "RSI14" not in df:
+        return False
+    if len(df.dropna(subset=["MACD","Signal"])) < 2:
+        return False
+    macd_now   = df["MACD"].iloc[-1]
+    macd_prev  = df["MACD"].iloc[-2]
+    sig_now    = df["Signal"].iloc[-1]
+    sig_prev   = df["Signal"].iloc[-2]
+    rsi_now    = df["RSI14"].iloc[-1] if not pd.isna(df["RSI14"].iloc[-1]) else 0
+    if any(pd.isna(x) for x in [macd_now, macd_prev, sig_now, sig_prev]):
+        return False
+    return (macd_now > sig_now) and (macd_prev <= sig_prev) and (rsi_now > 50)
+
+def confidence_score(trend_w, trend_d, e4, e1) -> int:
     score = 0
-    if w_last["EMA20"] > w_last["EMA50"]:
-        score += 25
-    if d_last["EMA20"] > d_last["EMA50"]:
-        score += 25
-    if d_last["MACD"] > d_last["MACDsig"]:
-        score += 15
-    if 45 <= d_last["RSI14"] <= 65:
-        score += 15
-    if d_last["Close"] > d_last["EMA20"]:
-        score += 10
-    vol = d_last.get("Volume", np.nan)
-    volma = d_last.get("VolMA20", np.nan)
-    if pd.notna(vol) and pd.notna(volma) and vol > 1.2 * volma:
-        score += 10
+    if trend_w == "UP": score += 30
+    if trend_d == "UP": score += 30
+    if e4: score += 20
+    if e1: score += 20
     return int(score)
 
-def pivot_levels_lastbar(df: pd.DataFrame):
-    h = float(df["High"].iloc[-1]); l = float(df["Low"].iloc[-1]); c = float(df["Close"].iloc[-1])
-    pivot = (h + l + c) / 3.0
-    r1 = 2 * pivot - l
-    s1 = 2 * pivot - h
-    r2 = pivot + (h - l)
-    s2 = pivot - (h - l)
-    return pivot, r1, r2, s1, s2
-
-def swing_levels(df: pd.DataFrame, window: int = 10):
-    return float(df["High"].tail(window).max()), float(df["Low"].tail(window).min())
-
-def entry_tp_sl(df: pd.DataFrame):
-    c = float(df["Close"].iloc[-1])
-    pivot, r1, r2, s1, s2 = pivot_levels_lastbar(df)
-    sh, slw = swing_levels(df, 10)
-    # Entry <= harga sekarang
-    candidates = [lvl for lvl in [df["EMA20"].iloc[-1], pivot, s1, slw] if pd.notna(lvl) and lvl <= c]
-    entry = max(candidates) if candidates else c * 0.99
-    # TP >= harga sekarang
-    res = [lvl for lvl in [r1, r2, sh] if lvl >= c]
-    tp = min(res) if res else c * 1.02
-    # SL <= harga sekarang
-    sup = [lvl for lvl in [s1, s2, slw] if lvl <= c]
-    stop = max(sup) if sup else c * 0.98
-    # jaga RR >= 1.0
-    risk = c - stop
-    reward = tp - c
-    if risk > 0 and reward / risk < 1.0:
-        tp = c + max(risk * 1.2, c * 0.01)
-    return float(entry), float(tp), float(stop), (pivot, r1, r2, s1, s2, sh, slw)
-
-# -----------------------------
-# Cached download dengan retry
-# -----------------------------
-@st.cache_data(show_spinner=False, ttl=60*15)  # cache 15 menit
-def cached_download(ticker: str, period: str, interval: str, retries: int = 2) -> pd.DataFrame:
-    last_err = None
-    for _ in range(max(1, retries)):
-        try:
-            df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-            if df is not None and not df.empty:
-                cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-                df = df[cols].copy()
-                for c in cols:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                df.dropna(subset=["Close"], inplace=True)
-                df.index = pd.to_datetime(df.index)
-                df.sort_index(inplace=True)
-                return df
-        except Exception as e:
-            last_err = e
-    # gagal
-    return pd.DataFrame()
-
-def load_tf_data(ticker: str, hemat: bool):
-    """Load semua timeframe sekaligus sesuai mode hemat."""
-    if hemat:
-        d1h = cached_download(ticker, "30d", "1h")
-        d4h = cached_download(ticker, "60d", "4h")
-        dd  = cached_download(ticker, "6mo", "1d")
-        dw  = cached_download(ticker, "3y", "1wk")
+def buy_match_status(current_price: float, entry_price: float, atr: float) -> tuple[str,str]:
+    """Kembalikan (pesan, warna). Toleransi max(0.5% * entry, 0.2*ATR)."""
+    if any(pd.isna(x) for x in [current_price, entry_price]):
+        return ("Data harga tidak memadai", "warning")
+    tol = max(0.005 * entry_price, 0.2 * (atr if not pd.isna(atr) else 0))
+    diff = current_price - entry_price
+    if abs(diff) <= tol:
+        return ("✅ MATCH (harga di area entry)", "success")
+    elif current_price < entry_price:
+        return ("⏳ Belum nyentuh harga entry", "info")
     else:
-        d1h = cached_download(ticker, "60d", "1h")
-        d4h = cached_download(ticker, "60d", "4h")
-        dd  = cached_download(ticker, "1y",  "1d")
-        dw  = cached_download(ticker, "5y",  "1wk")
-    return d1h, d4h, dd, dw
+        return ("⚠️ Harga sudah melewati area entry", "error")
 
-# -----------------------------
-# Sidebar Controls
-# -----------------------------
+# =========================
+# Plotting
+# =========================
+def plot_chart(df: pd.DataFrame, title: str, levels: dict | None = None) -> go.Figure:
+    fig = go.Figure()
+    if df is None or df.empty:
+        fig.update_layout(title=f"{title} (data tidak tersedia)")
+        return fig
+
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"],
+        low=df["Low"], close=df["Close"], name="Price"
+    ))
+    if "MA9" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["MA9"], mode="lines", name="MA9", line=dict(color="orange")))
+    # Horizontal level lines via shapes (lebih kompatibel)
+    if levels:
+        x0 = df.index.min()
+        x1 = df.index.max()
+        shape_map = {
+            "Entry": {"color":"#3498db"},
+            "Target": {"color":"#2ecc71"},
+            "Stop": {"color":"#e74c3c"},
+        }
+        for key, y in levels.items():
+            if pd.isna(y): 
+                continue
+            color = shape_map.get(key, {}).get("color", "#888")
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=y, y1=y,
+                          line=dict(color=color, width=1, dash="dot"))
+            fig.add_annotation(x=x1, y=y, text=key, showarrow=False, font=dict(color=color), xanchor="right", yanchor="bottom")
+
+    fig.update_layout(title=title, xaxis_rangeslider_visible=False, height=500, template="plotly_white")
+    return fig
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="Multi-Timeframe Stock Analyzer Pro", layout="wide")
+st.title("📊 Multi-Timeframe Stock Analyzer Pro")
+
 with st.sidebar:
     st.header("Pengaturan Analisis")
-    raw_ticker = st.text_input("Ticker (contoh: GOTO / BBCA / AAPL / TLKM.JK)", value="BBCA")
+    raw_ticker = st.text_input("Ticker (contoh: BBCA atau AAPL)", value="BBCA")
     ticker = normalize_ticker(raw_ticker)
     avg_buy = st.number_input("Avg Buy (Rp per lembar)", min_value=0.0, value=0.0, step=1.0)
-    lots = st.number_input("Jumlah lot (1 lot = 100 lembar)", min_value=0, value=0, step=1)
-    hemat = st.checkbox("Mode Hemat Bandwidth", value=True)
-    theme = st.selectbox("Tema Chart", ["Dark", "Light"], index=0)
-    show_levels = st.checkbox("Tampilkan Level (Pivot/Swing/Entry-TP-SL)", value=True)
+    lots    = st.number_input("Jumlah lot (1 lot = 100)", min_value=0, value=0, step=1)
+    st.caption("💡 BEI otomatis ditambah **.JK** jika tidak diisi.")
 
-    st.markdown("---")
-    st.subheader("🛡️ Risk Manager")
-    acc_value = st.number_input("Nilai Akun (Rp)", min_value=0.0, value=0.0, step=100000.0, help="Estimasi total ekuitas Anda")
-    risk_pct = st.number_input("Risiko per Transaksi (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-    if st.button("Clear Cache"):
-        st.cache_data.clear()
-        st.success("Cache dibersihkan.")
-
-# -----------------------------
-# Load & Indicators
-# -----------------------------
 if not ticker:
     st.warning("Masukkan ticker terlebih dahulu.")
     st.stop()
 
-d1h, d4h, dd, dw = load_tf_data(ticker, hemat)
+# Ambil data per timeframe
+df_w  = add_indicators(get_data(ticker, period="2y",  interval="1wk"))
+df_d  = add_indicators(get_data(ticker, period="1y",  interval="1d"))
+df_h4 = add_indicators(get_data(ticker, period="60d", interval="4h"))
+df_h1 = add_indicators(get_data(ticker, period="30d", interval="1h"))
 
-d1h_i = add_indicators(d1h)
-d4h_i = add_indicators(d4h)
-dd_i  = add_indicators(dd)
-dw_i  = add_indicators(dw)
+# Analisis multi-timeframe
+trend_w = get_trend(df_w)
+trend_d = get_trend(df_d)
+entry4  = has_entry_signal(df_h4)
+entry1  = has_entry_signal(df_h1)
+score   = confidence_score(trend_w, trend_d, entry4, entry1)
 
-# Confidence & overall summary dari Daily + Weekly
-if not dd_i.empty and not dw_i.empty:
-    last_d = dd_i.iloc[-1]
-    last_w = dw_i.iloc[-1]
-    conf = confidence_score(last_d, last_w)
-    overall_trend = "🟢 Uptrend" if (last_d["EMA20"] > last_d["EMA50"]) and (last_w["EMA20"] > last_w["EMA50"]) else "🔴 Mixed/Down"
-    overall_rec = rec_signal(last_d)
-else:
-    conf = 0
-    overall_trend = "❔ Data kurang"
-    overall_rec = "⚠️ HOLD"
-
-# Entry/TP/SL dari Daily
-if not dd_i.empty:
-    ent, tp, sl, lv = entry_tp_sl(dd_i)
-    pivot, r1, r2, s1, s2, sh, slw = lv
-else:
-    ent = tp = sl = np.nan
-    pivot = r1 = r2 = s1 = s2 = sh = slw = np.nan
-
-# Risk Manager (ukuran posisi)
-position_info = ""
-if acc_value > 0 and not np.isnan(sl) and not dd_i.empty:
-    last_close = float(dd_i["Close"].iloc[-1])
-    risk_amt = acc_value * (risk_pct / 100.0)
-    per_share_risk = max(last_close - sl, 0.0)
-    if per_share_risk > 0:
-        shares = int(risk_amt // per_share_risk)
-        lots_suggest = max(shares // 100, 0)
-        position_info = f"🎯 Saran ukuran posisi: **{lots_suggest} lot** (~{lots_suggest*100} lembar) dengan risiko ± Rp{risk_amt:,.0f}"
-    else:
-        position_info = "Tidak dapat menghitung ukuran posisi (SL >= harga)."
-
-# -----------------------------
-# Summary Header
-# -----------------------------
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Ticker", ticker)
-c2.metric("Overall Trend", overall_trend)
-c3.metric("Confidence", f"{conf} / 100")
-c4.metric("Rekomendasi", overall_rec)
-
-if not np.isnan(ent):
-    st.markdown(
-        f"**Entry (BoW)**: `{ent:.2f}` • **TP**: `{tp:.2f}` • **SL**: `{sl:.2f}`  "
-        f"• **Pivot | R1 | R2**: `{pivot:.2f} | {r1:.2f} | {r2:.2f}`  "
-        f"• **SwingH | SwingL (10)**: `{sh:.2f} | {slw:.2f}`"
-    )
-else:
-    st.info("Tidak cukup data Daily untuk menghitung Entry/TP/SL.")
-
-if position_info:
-    st.success(position_info)
-
-# -----------------------------
-# Chart helper
-# -----------------------------
-def chart_price(dfx: pd.DataFrame, title: str):
-    template = "plotly_dark" if theme == "Dark" else "plotly_white"
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=dfx.index, open=dfx["Open"], high=dfx["High"], low=dfx["Low"], close=dfx["Close"], name="Price"
-    ))
-    fig.add_trace(go.Scatter(x=dfx.index, y=dfx["EMA20"], line=dict(color="#f39c12", width=1.5), name="EMA20"))
-    fig.add_trace(go.Scatter(x=dfx.index, y=dfx["EMA50"], line=dict(color="#3498db", width=1.5), name="EMA50"))
-
-    if show_levels and not dd_i.empty and title.endswith("Daily"):
-        # tambahkan garis level pada chart Daily saja supaya tidak ramai
-        for y, name, color in [
-            (ent, "Entry", "#1abc9c"),
-            (tp, "TP", "#2ecc71"),
-            (sl, "SL", "#e74c3c"),
-            (pivot, "Pivot", "#95a5a6"),
-            (r1, "R1", "#e67e22"),
-            (r2, "R2", "#d35400"),
-            (sh, "SwingH", "#c0392b"),
-            (slw, "SwingL", "#2980b9"),
-        ]:
-            if pd.notna(y):
-                fig.add_hline(y=y, line_dash="dot", line_color=color, annotation_text=name, annotation_position="top right")
-
-    fig.update_layout(
-        title=title, xaxis_rangeslider_visible=False, height=420,
-        template=template, legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0)
-    )
-    return fig
-
-# -----------------------------
 # Tabs
-# -----------------------------
-tabs = st.tabs(["🕐 1H", "⏳ 4H", "📅 Daily", "📆 Weekly"])
-tf_map = {
-    0: ("1H", d1h_i),
-    1: ("4H", d4h_i),
-    2: ("Daily", dd_i),
-    3: ("Weekly", dw_i),
-}
+tab_w, tab_d, tab_h4, tab_h1, tab_rec = st.tabs(["📆 Weekly", "📅 Daily", "⏳ 4H", "🕐 1H", "💡 Rekomendasi"])
 
-for i in range(4):
-    label, dfx = tf_map[i]
-    with tabs[i]:
-        st.subheader(f"{label} - {ticker}")
-        if dfx.empty:
-            st.warning("⚠️ Data tidak tersedia untuk timeframe ini.")
-            continue
+with tab_w:
+    st.subheader(f"Weekly - {ticker}")
+    st.plotly_chart(plot_chart(df_w, "Weekly Chart"), use_container_width=True)
+    st.write(f"Trend: **{trend_w}**")
 
-        # Price chart
-        fig = chart_price(dfx, f"{ticker} • {label}")
-        st.plotly_chart(fig, use_container_width=True)
+with tab_d:
+    st.subheader(f"Daily - {ticker}")
+    st.plotly_chart(plot_chart(df_d, "Daily Chart"), use_container_width=True)
+    st.write(f"Trend: **{trend_d}**")
 
-        # Metrics
-        last = dfx.iloc[-1]
-        vol_note = "-"
-        if "VolMA20" in dfx.columns and pd.notna(last.get("VolMA20")) and pd.notna(last.get("Volume")):
-            if last["Volume"] > 1.2 * last["VolMA20"]:
-                vol_note = "Tinggi"
-            elif last["Volume"] < 0.8 * last["VolMA20"]:
-                vol_note = "Rendah"
-            else:
-                vol_note = "Normal"
+with tab_h4:
+    st.subheader(f"4H - {ticker}")
+    st.plotly_chart(plot_chart(df_h4, "4H Chart"), use_container_width=True)
+    st.write(f"Entry signal (MACD cross-up & RSI>50): **{'YES' if entry4 else 'NO'}**")
 
-        colA, colB, colC, colD = st.columns(4)
-        colA.metric("Harga", f"{last['Close']:.2f}")
-        colB.metric("RSI(14)", f"{last['RSI14']:.2f}")
-        colC.metric("Trend", trend_label(last))
-        colD.metric("Volume", f"{int(last.get('Volume', 0)):,} ({vol_note})")
+with tab_h1:
+    st.subheader(f"1H - {ticker}")
+    st.plotly_chart(plot_chart(df_h1, "1H Chart"), use_container_width=True)
+    st.write(f"Entry signal (MACD cross-up & RSI>50): **{'YES' if entry1 else 'NO'}**")
 
-        st.markdown(
-            f"**MACD / Signal**: `{last['MACD']:.2f} / {last['MACDsig']:.2f}` • "
-            f"**EMA20 / EMA50**: `{last['EMA20']:.2f} / {last['EMA50']:.2f}` • "
-            f"**Rekomendasi {label}**: {rec_signal(last)}"
-        )
+with tab_rec:
+    st.subheader("Ringkas Rekomendasi")
+    colA, colB, colC, colD, colE = st.columns(5)
+    colA.metric("Weekly", trend_w)
+    colB.metric("Daily", trend_d)
+    colC.metric("H4 Entry", "YES" if entry4 else "NO")
+    colD.metric("H1 Entry", "YES" if entry1 else "NO")
+    colE.metric("Confidence", f"{score}%")
 
-# -----------------------------
-# P/L di Sidebar
-# -----------------------------
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("💰 Hasil Investasi")
-    if avg_buy > 0 and lots > 0:
-        d_now = cached_download(ticker, "5d", "1d")
-        if not d_now.empty:
-            last_px = float(d_now["Close"].iloc[-1])
-            qty = lots * 100
-            modal = avg_buy * qty
-            nilai = last_px * qty
-            pl = nilai - modal
-            pl_pct = (pl / modal * 100) if modal else 0.0
-            st.write(f"- Harga Sekarang: **{last_px:,.2f}**")
-            st.write(f"- Qty: **{qty:,}** lembar")
-            st.write(f"- Modal: **{modal:,.0f}**")
-            st.write(f"- Nilai Sekarang: **{nilai:,.0f}**")
-            st.write(f"- P/L: **{pl:,.0f} ({pl_pct:.2f}%)**")
-        else:
-            st.warning("Tidak bisa menghitung P/L (data harga terkini kosong).")
+    st.progress(min(max(score/100, 0), 1.0))
+
+    # Syarat beli: Weekly & Daily UP + (H4 atau H1 entry)
+    can_buy = (trend_w == "UP") and (trend_d == "UP") and (entry4 or entry1)
+    if not df_d.empty:
+        last_close = float(df_d["Close"].iloc[-1])
+        atr_d      = float(df_d["ATR"].iloc[-1]) if "ATR" in df_d and not pd.isna(df_d["ATR"].iloc[-1]) else np.nan
     else:
-        st.info("Isi Avg Buy & Lot untuk melihat P/L.")
+        last_close, atr_d = np.nan, np.nan
 
-st.markdown("---")
-st.caption("Disclaimer: Analisis ini bersifat edukasi dan berbasis indikator teknikal sederhana. Lakukan riset mandiri dan gunakan manajemen risiko yang disiplin.")
+    if can_buy and not pd.isna(last_close):
+        entry_price = last_close
+        # Jika ATR NaN (data terlalu pendek), fallback 2% dari harga
+        risk_unit  = atr_d if not pd.isna(atr_d) else 0.02 * entry_price
+        stop_price = entry_price - 1.5 * risk_unit
+        target     = entry_price + 3.0 * risk_unit
+
+        st.success(f"✅ **Rekomendasi BELI** sekitar **Rp {entry_price:,.2f}**")
+        st.write(f"🎯 **Target**: Rp {target:,.2f}   |   🛑 **Stop**: Rp {stop_price:,.2f}")
+
+        # Status pembelian
+        msg, color = buy_match_status(current_price=last_close, entry_price=entry_price, atr=atr_d)
+        getattr(st, color)(f"📌 {msg}")
+
+        # Chart daily dengan level
+        levels = {"Entry": entry_price, "Target": target, "Stop": stop_price}
+        st.plotly_chart(plot_chart(df_d, "Daily Chart + Levels", levels), use_container_width=True)
+    else:
+        st.warning("❌ Belum ada kondisi beli ideal (butuh Weekly & Daily **UP** dan sinyal entry di H4/H1).")
+
+    # P/L sederhana jika user isi posisi
+    if (avg_buy or 0) > 0 and (lots or 0) > 0 and not pd.isna(last_close):
+        shares = int(lots) * 100
+        pnl = (last_close - avg_buy) * shares
+        pnl_pct = ((last_close - avg_buy) / avg_buy * 100) if avg_buy > 0 else 0
+        st.info(f"💼 P/L: **Rp {pnl:,.0f}**  ( {pnl_pct:.2f}% ) — Qty: {shares} lembar")
+
+# ====== End ======
