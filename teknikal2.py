@@ -1,132 +1,82 @@
+# streamlit_tv.py
 import streamlit as st
-import requests
-import json
-import websocket
-import threading
 import pandas as pd
+import numpy as np
+import ta
+from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-import time
+from tvDatafeed import TvDatafeed, Interval
 
-BASE_URL = "https://api.stockbit.com"
+st.set_page_config(page_title="TradingView Analyzer", layout="wide")
+st.title("📊 Stock Analyzer via TradingView")
 
-# -------------------------
-# Login function
-# -------------------------
-def stockbit_login(username, password):
-    url = f"{BASE_URL}/v2/auth/login"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    payload = {"username": username, "password": password}
-    resp = requests.post(url, json=payload, headers=headers)
-
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Gagal decode JSON: {resp.text}")
-
-    if not data.get("status", False):
-        raise Exception(f"Login gagal: {data}")
-
-    return data["data"]["token"]
-
-# -------------------------
-# WebSocket client
-# -------------------------
-class StockbitWS:
-    def __init__(self, token, symbols):
-        self.token = token
-        self.symbols = symbols
-        self.ws = None
-        self.data = []
-
-    def on_message(self, ws, message):
-        msg = json.loads(message)
-        if "data" in msg:
-            self.data.append(msg["data"])
-
-    def on_error(self, ws, error):
-        print("Error:", error)
-
-    def on_close(self, ws, close_status_code, close_msg):
-        print("WS Closed")
-
-    def on_open(self, ws):
-        # subscribe ke ticker tertentu
-        for sym in self.symbols:
-            sub_msg = {
-                "cmd": "subscribe",
-                "channel": f"trading.{sym}"
-            }
-            ws.send(json.dumps(sub_msg))
-
-    def run(self):
-        ws_url = f"wss://ws.stockbit.com/"
-        self.ws = websocket.WebSocketApp(
-            ws_url,
-            header=[f"Authorization: Bearer {self.token}"],
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close,
-            on_open=self.on_open
-        )
-        thread = threading.Thread(target=self.ws.run_forever, daemon=True)
-        thread.start()
-
-# -------------------------
-# Streamlit App
-# -------------------------
-st.set_page_config(page_title="Stockbit Realtime Analyzer", layout="wide")
-st.title("📊 Stockbit Realtime Analyzer")
-
+# Sidebar input
 with st.sidebar:
-    st.markdown("### 🔑 Login")
-    user = st.text_input("Username / Email")
-    pwd = st.text_input("Password", type="password")
-    ticker = st.text_input("Ticker (contoh: BBCA)", value="BBCA").upper()
-    run_btn = st.button("Start Realtime Feed")
+    st.markdown("## Input")
+    ticker = st.text_input("Ticker (contoh: BBCA untuk IDX, AAPL untuk NASDAQ)", value="BBCA").upper().strip()
+    exchange = st.text_input("Exchange (contoh: IDX, NASDAQ, NYSE)", value="IDX").upper().strip()
+    timeframe = st.selectbox("Timeframe", ["1m","5m","15m","1h","1d","1W"], index=4)
+    n_bars = st.number_input("Jumlah bar data", min_value=100, max_value=2000, value=500, step=100)
 
-if run_btn:
-    if not user or not pwd:
-        st.error("Masukkan username & password dulu!")
-        st.stop()
+# Map timeframe
+interval_map = {
+    "1m": Interval.in_1_minute,
+    "5m": Interval.in_5_minute,
+    "15m": Interval.in_15_minute,
+    "1h": Interval.in_1_hour,
+    "1d": Interval.in_daily,
+    "1W": Interval.in_weekly
+}
 
-    try:
-        token = stockbit_login(user, pwd)
-        st.success("✅ Login berhasil")
-    except Exception as e:
-        st.error(f"Login gagal: {e}")
-        st.stop()
+# Init tvdatafeed
+tv = TvDatafeed()  # anonymous mode
 
-    # Start websocket
-    ws_client = StockbitWS(token, [ticker])
-    ws_client.run()
+# Download OHLCV
+df = tv.get_hist(symbol=ticker, exchange=exchange, interval=interval_map[timeframe], n_bars=n_bars)
 
-    st.info(f"Streaming realtime data untuk {ticker} ...")
+if df is None or df.empty:
+    st.error("Tidak ada data. Periksa ticker & exchange.")
+    st.stop()
 
-    chart_placeholder = st.empty()
-    table_placeholder = st.empty()
+# Compute indicators
+df['MA9'] = df['close'].rolling(9).mean()
+df['RSI14'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+macd_obj = ta.trend.MACD(df['close'])
+df['MACD'] = macd_obj.macd()
+df['Signal'] = macd_obj.macd_signal()
+df['VolMA20'] = df['volume'].rolling(20).mean()
 
-    price_data = []
+last = df.iloc[-1]
+rekom = "BUY" if last['close'] > last['MA9'] and last['MACD'] > last['Signal'] and last['RSI14'] < 70 else "SELL" if last['close'] < last['MA9'] and last['MACD'] < last['Signal'] else "HOLD"
 
-    while True:
-        if ws_client.data:
-            new_tick = ws_client.data.pop()
-            ts = pd.to_datetime(new_tick.get("timestamp", time.time()), unit="s")
-            px = float(new_tick.get("last", 0))
-            vol = new_tick.get("volume", 0)
+# Show metrics
+col1, col2, col3 = st.columns(3)
+col1.metric("Ticker", f"{ticker}.{exchange}")
+col2.metric("Harga Sekarang", f"{last['close']:.2f}")
+col3.metric("Rekomendasi", rekom)
 
-            price_data.append({"time": ts, "price": px, "volume": vol})
-            df = pd.DataFrame(price_data)
+st.markdown("### 📈 Chart Interaktif")
+fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                    row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.02,
+                    subplot_titles=("Harga + MA9", "RSI", "MACD"))
 
-            # Plot
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df["time"], y=df["price"], mode="lines+markers", name="Price"))
-            fig.update_layout(template="plotly_dark", height=500)
-            chart_placeholder.plotly_chart(fig, use_container_width=True)
+# Candlestick
+fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'],
+                             low=df['low'], close=df['close'], name="Price"), row=1, col=1)
+fig.add_trace(go.Scatter(x=df.index, y=df['MA9'], mode='lines', name='MA9', line=dict(color='orange')), row=1, col=1)
 
-            table_placeholder.dataframe(df.tail(10))
+# RSI
+fig.add_trace(go.Scatter(x=df.index, y=df['RSI14'], mode='lines', name='RSI', line=dict(color='yellow')), row=2, col=1)
+fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
 
-        time.sleep(1)
+# MACD
+fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], mode='lines', name='MACD', line=dict(color='cyan')), row=3, col=1)
+fig.add_trace(go.Scatter(x=df.index, y=df['Signal'], mode='lines', name='Signal', line=dict(color='magenta')), row=3, col=1)
+fig.add_hline(y=0, line_dash="dot", line_color="white", row=3, col=1)
+
+fig.update_layout(template="plotly_dark", height=900, xaxis_rangeslider_visible=False, showlegend=True)
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.info("Data diambil dari TradingView via `tvdatafeed`. Untuk realtime penuh butuh websocket TradingView (unofficial).")
