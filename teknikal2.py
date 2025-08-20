@@ -1,4 +1,5 @@
-# streamlit_stockbit.py
+# streamlit_ministockbit.py
+
 import streamlit as st
 import requests, json, websocket, threading
 import pandas as pd
@@ -7,102 +8,62 @@ from datetime import datetime
 
 BASE_URL = "https://api.stockbit.com"
 
-st.set_page_config(page_title="Stockbit Analyzer", layout="wide")
-st.title("📊 Stockbit Real-Time Analyzer")
+st.title("Real-Time Analyzer Stockbit (Mini)")
 
-# --------------------
-# Login Section
-# --------------------
+# Sidebar: login ke Stockbit
 with st.sidebar:
-    st.subheader("🔑 Login Broker")
-    username = st.text_input("Username / Email")
-    password = st.text_input("Password", type="password")
+    st.subheader("Login")
+    USER = st.text_input("Email / Username")
+    PASS = st.text_input("Password", type="password")
     if st.button("Login"):
-        try:
-            resp = requests.post(f"{BASE_URL}/v2/auth/login",
-                                 json={"username": username, "password": password})
-            data = resp.json()
-            if "data" in data and "token" in data["data"]:
-                st.session_state["token"] = data["data"]["token"]
-                st.success("Login berhasil ✅")
-            else:
-                st.error("Login gagal ❌")
-        except Exception as e:
-            st.error(f"Gagal login: {e}")
+        resp = requests.post(f"{BASE_URL}/v2/auth/login", json={"username": USER, "password": PASS})
+        data = resp.json()
+        token = data.get("data", {}).get("token")
+        if token:
+            st.session_state.token = token
+            st.success("Login berhasil")
+        else:
+            st.error("Login gagal")
 
-# stop if not login
 if "token" not in st.session_state:
-    st.warning("Silakan login dulu")
     st.stop()
 
-token = st.session_state["token"]
+token = st.session_state.token
+headers = {"Authorization": f"Bearer {token}"}
 
-# --------------------
-# Input saham
-# --------------------
-ticker = st.text_input("Kode saham (contoh: BBRI)", value="BBRI").upper()
+# Input ticker
+ticker = st.text_input("Kode saham (IDX)","BBRI").upper()
 
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("Ambil Data Sekarang"):
-        headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(f"{BASE_URL}/v2/trade/quotes?symbols={ticker}", headers=headers)
-        data = resp.json()
-        st.json(data)
+# REST: ambil snapshot harga
+if st.button("Fetch Now"):
+    resp = requests.get(f"{BASE_URL}/v2/trade/quotes?symbols={ticker}", headers=headers)
+    st.json(resp.json())
 
-# --------------------
-# Real-Time WebSocket
-# --------------------
-st.subheader("📡 Real-Time Feed")
+# Real-time WebSocket stream
+st.subheader("Real-Time Ticker")
 
 if st.button("Start Stream"):
-    st.session_state["prices"] = []
+    st.session_state.prices = []
 
-    def on_message(ws, message):
-        msg = json.loads(message)
-        if "symbol" in msg and msg["symbol"] == ticker:
-            ts = datetime.now()
-            px = float(msg["last"]) if "last" in msg else None
-            if px:
-                st.session_state["prices"].append({"time": ts, "price": px})
-                # keep last 100
-                st.session_state["prices"] = st.session_state["prices"][-100:]
+    def on_message(ws, msg):
+        j = json.loads(msg)
+        if j.get("symbol")==ticker and "last" in j:
+            st.session_state.prices.append({"time":datetime.now(), "price": float(j["last"])})
+            st.session_state.prices = st.session_state.prices[-100:]
 
     def on_open(ws):
-        ws.send(json.dumps({"type": "subscribe", "symbols": [ticker]}))
+        ws.send(json.dumps({"type":"subscribe","symbols":[ticker]}))
 
     def run_ws():
-        ws = websocket.WebSocketApp(
-            "wss://ws.stockbit.com",
-            header=[f"Authorization: Bearer {token}"],
-            on_message=on_message,
-            on_open=on_open
-        )
+        ws = websocket.WebSocketApp("wss://ws.stockbit.com",
+            header=[f"Authorization:Bearer {token}"],
+            on_message=on_message, on_open=on_open)
         ws.run_forever()
 
-    thread = threading.Thread(target=run_ws, daemon=True)
-    thread.start()
-    st.success("Streaming dimulai ✅")
+    threading.Thread(target=run_ws, daemon=True).start()
+    st.success("Streaming...")
 
-# --------------------
-# Chart harga real-time
-# --------------------
-if "prices" in st.session_state and len(st.session_state["prices"]) > 0:
-    df = pd.DataFrame(st.session_state["prices"])
-    fig = go.Figure(go.Scatter(x=df["time"], y=df["price"], mode="lines+markers"))
-    fig.update_layout(title=f"Real-Time {ticker}", xaxis_title="Waktu", yaxis_title="Harga")
+if "prices" in st.session_state and st.session_state.prices:
+    df = pd.DataFrame(st.session_state.prices)
+    fig = go.Figure(go.Scatter(x=df.time, y=df.price))
     st.plotly_chart(fig, use_container_width=True)
-
-# --------------------
-# Order Section
-# --------------------
-st.subheader("🛒 Kirim Order")
-side = st.radio("Aksi", ["BUY", "SELL"], horizontal=True)
-price = st.number_input("Harga", min_value=0.0, step=1.0)
-qty = st.number_input("Jumlah lembar", min_value=100, step=100)
-
-if st.button("Kirim Order"):
-    headers = {"Authorization": f"Bearer {token}"}
-    order = {"symbol": ticker, "side": side, "price": price, "qty": qty, "order_type": "LIMIT"}
-    resp = requests.post(f"{BASE_URL}/v2/trade/orders", headers=headers, json=order)
-    st.json(resp.json())
