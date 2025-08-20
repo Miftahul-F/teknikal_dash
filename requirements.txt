@@ -1,8 +1,6 @@
 streamlit
-yfinance
 pandas
 numpy
-ta
 plotly
-requests
-websocket-client
+ta
+git+https://github.com/StreamAlpha/tvdatafeed.git
