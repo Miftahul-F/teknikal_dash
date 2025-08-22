@@ -3,4 +3,3 @@ pandas
 numpy
 plotly
 ta
-git+https://github.com/StreamAlpha/tvdatafeed.git
