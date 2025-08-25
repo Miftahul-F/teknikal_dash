@@ -4,19 +4,11 @@ import pandas as pd
 import yfinance as yf
 import ta
 
-# ==============================
-# Konfigurasi awal
-# ==============================
 st.set_page_config(page_title="LQ45 Stock Analyzer Pro", layout="wide")
-
 st.title("📊 LQ45 Stock Analyzer Pro")
-st.markdown("Analisis otomatis saham LQ45 (data Yahoo Finance ~15 menit delay)")
 
 period = st.selectbox("Pilih periode data:", ["3mo", "6mo", "1y", "2y"], index=2)
 
-# ==============================
-# Daftar saham LQ45
-# ==============================
 lq45 = [
     "ADRO.JK","AKRA.JK","AMRT.JK","ANTM.JK","ARTO.JK","ASII.JK","BBCA.JK","BBNI.JK","BBRI.JK",
     "BBTN.JK","BMRI.JK","BRIS.JK","BUKA.JK","CPIN.JK","ELSA.JK","EMTK.JK","ESSA.JK","EXCL.JK",
@@ -25,76 +17,61 @@ lq45 = [
     "PTPP.JK","SMGR.JK","TBIG.JK","TINS.JK","TKIM.JK","TLKM.JK","TOWR.JK","UNTR.JK","UNVR.JK"
 ]
 
-# ==============================
-# Fungsi Analisis Saham
-# ==============================
 def analyze_stock(ticker):
     try:
         df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
-
         if df.empty:
             return None
 
-        # Reset index untuk hilangkan multi-index
+        # pastikan dataframe flat
         df = df.reset_index()
 
-        # Pastikan hanya ambil kolom yang penting
-        cols = ["Date","Open","High","Low","Close","Volume"]
-        df = df[cols].copy()
+        # ambil hanya kolom inti
+        needed_cols = [c for c in ["Date","Open","High","Low","Close","Volume"] if c in df.columns]
+        df = df[needed_cols].copy()
 
-        # Convert semua ke numeric
+        # pastikan semua numeric
         for col in ["Open","High","Low","Close","Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna()
-        if df.empty:
+        if df.empty or "Close" not in df.columns:
             return None
 
-        # indikator teknikal (pakai float series agar aman)
-        df["MA9"] = df["Close"].rolling(9).mean()
+        # pastikan 1D series float
+        close = df["Close"].astype(float).squeeze()
+        high = df["High"].astype(float).squeeze()
+        low = df["Low"].astype(float).squeeze()
 
-        rsi_ind = ta.momentum.RSIIndicator(close=df["Close"].astype(float), window=14)
-        df["RSI"] = rsi_ind.rsi()
-
-        macd = ta.trend.MACD(close=df["Close"].astype(float))
-        df["MACD"] = macd.macd()
-        df["MACD_signal"] = macd.macd_signal()
-
-        atr = ta.volatility.AverageTrueRange(
-            high=df["High"].astype(float),
-            low=df["Low"].astype(float),
-            close=df["Close"].astype(float),
-            window=14
-        )
-        df["ATR"] = atr.average_true_range()
+        df["MA9"] = close.rolling(9).mean()
+        df["RSI"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
+        macd_ind = ta.trend.MACD(close=close)
+        df["MACD"] = macd_ind.macd()
+        df["MACD_signal"] = macd_ind.macd_signal()
+        atr_ind = ta.volatility.AverageTrueRange(high=high, low=low, close=close, window=14)
+        df["ATR"] = atr_ind.average_true_range()
 
         last = df.iloc[-1]
-        close = last["Close"]
-        ma9 = last["MA9"]
-        rsi = last["RSI"]
-        macd_val = last["MACD"]
-        sig = last["MACD_signal"]
-        atr_val = last["ATR"]
+        entry = last["Close"]
+        tp = entry + 1.5 * last["ATR"]
+        sl = entry - 1.0 * last["ATR"]
 
-        entry = close
-        tp = close + 1.5 * atr_val
-        sl = close - 1.0 * atr_val
-
-        if close > ma9 and macd_val > sig and rsi < 70:
+        if last["Close"] > last["MA9"] and last["MACD"] > last["MACD_signal"] and last["RSI"] < 70:
             rekom = "BUY"
-        elif close < ma9 and macd_val < sig and rsi > 50:
+        elif last["Close"] < last["MA9"] and last["MACD"] < last["MACD_signal"] and last["RSI"] > 50:
             rekom = "SELL"
         else:
             rekom = "HOLD"
 
         return {
             "Ticker": ticker,
-            "Close": round(close,2),
-            "MA9": round(ma9,2),
-            "RSI": round(rsi,2),
-            "MACD": round(macd_val,2),
-            "Signal": round(sig,2),
-            "ATR": round(atr_val,2),
+            "Close": round(entry,2),
+            "MA9": round(last["MA9"],2),
+            "RSI": round(last["RSI"],2),
+            "MACD": round(last["MACD"],2),
+            "Signal": round(last["MACD_signal"],2),
+            "ATR": round(last["ATR"],2),
             "Rekomendasi": rekom,
             "Entry": round(entry,2),
             "TP": round(tp,2),
@@ -102,36 +79,22 @@ def analyze_stock(ticker):
         }
 
     except Exception as e:
-        st.error(f"⚠️ Error {ticker}: {e}")
+        st.warning(f"⚠️ Error {ticker}: {e}")
         return None
 
-# ==============================
-# Jalankan analisis semua saham
-# ==============================
-st.write("⏳ Mengambil data, mohon tunggu...")
+st.write("⏳ Mengambil data saham LQ45...")
 
-results = []
-for t in lq45:
-    res = analyze_stock(t)
-    if res:
-        results.append(res)
+results = [analyze_stock(t) for t in lq45]
+results = [r for r in results if r]
 
 if results:
     df_results = pd.DataFrame(results)
-    # urutkan BUY paling atas
-    df_results = df_results.sort_values(
-        by=["Rekomendasi","RSI"],
-        ascending=[False, True]
-    ).reset_index(drop=True)
-
+    df_results = df_results.sort_values(by=["Rekomendasi","RSI"], ascending=[False,True]).reset_index(drop=True)
     st.dataframe(df_results, use_container_width=True)
 
-    # ringkasan
-    buy_count = (df_results["Rekomendasi"]=="BUY").sum()
-    sell_count = (df_results["Rekomendasi"]=="SELL").sum()
-    hold_count = (df_results["Rekomendasi"]=="HOLD").sum()
-
-    st.success(f"✅ BUY: {buy_count} | ❌ SELL: {sell_count} | ⏸ HOLD: {hold_count}")
-
+    buy = (df_results["Rekomendasi"]=="BUY").sum()
+    sell = (df_results["Rekomendasi"]=="SELL").sum()
+    hold = (df_results["Rekomendasi"]=="HOLD").sum()
+    st.success(f"✅ BUY: {buy} | ❌ SELL: {sell} | ⏸ HOLD: {hold}")
 else:
-    st.warning("Gagal mengambil data LQ45. Coba ulangi lagi.")
+    st.error("Tidak ada data berhasil diambil.")
