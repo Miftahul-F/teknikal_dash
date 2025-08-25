@@ -6,23 +6,13 @@ import ta
 import pytz
 from datetime import datetime
 
-st.set_page_config(page_title="LQ45 Multi-Stock Analyzer", layout="wide")
-
-# --- Daftar LQ45 ---
-LQ45 = [
-    "ADRO.JK","AKRA.JK","AMRT.JK","ANTM.JK","ARTO.JK","ASII.JK",
-    "BBCA.JK","BBNI.JK","BBRI.JK","BBTN.JK","BMRI.JK","BRPT.JK",
-    "BUKA.JK","CPIN.JK","ELSA.JK","ERAA.JK","EXCL.JK","GGRM.JK",
-    "HMSP.JK","HRUM.JK","ICBP.JK","INDF.JK","INDY.JK","INKP.JK",
-    "INTP.JK","ITMG.JK","JPFA.JK","JSMR.JK","KLBF.JK","MDKA.JK",
-    "MEDC.JK","MIKA.JK","MNCN.JK","PGAS.JK","PTBA.JK","SCMA.JK",
-    "SMGR.JK","TBIG.JK","TINS.JK","TKIM.JK","TLKM.JK","TOWR.JK",
-    "UNTR.JK","UNVR.JK","WIKA.JK"
-]
+st.set_page_config(page_title="📊 Indonesia Stock Analyzer", layout="wide")
 
 # --- Fungsi ambil data ---
 def get_data(ticker):
     try:
+        if not ticker.endswith(".JK"):
+            ticker = ticker + ".JK"
         df = yf.download(ticker, period="6mo", interval="1d", progress=False)
         if df.empty or "Close" not in df:
             return None
@@ -31,14 +21,11 @@ def get_data(ticker):
     except Exception:
         return None
 
-# --- Fungsi hitung indikator ---
+# --- Fungsi indikator ---
 def add_indicators(df):
     try:
-        if df is None or df.empty:
+        if df is None or df.empty or df["Close"].isnull().all():
             return None
-        if df["Close"].isnull().all():
-            return None
-
         df["RSI"] = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
         macd = ta.trend.MACD(close=df["Close"])
         df["MACD"] = macd.macd()
@@ -48,49 +35,47 @@ def add_indicators(df):
     except Exception:
         return None
 
-# --- Fungsi generate sinyal ---
+# --- Fungsi sinyal + estimasi beli ---
 def generate_signal(df):
     if df is None or df.empty:
-        return "⚠️ Error Indicators"
+        return "⚠️ Error", None
     try:
         last = df.iloc[-1]
         if last["RSI"] < 30 and last["MACD"] > last["Signal"] and last["Close"] > last["EMA20"]:
-            return "✅ BUY"
+            est_buy = round(last["Close"] * 1.01, 2)   # estimasi buy besok pagi = close hari ini +1%
+            return "✅ BUY", est_buy
         elif last["RSI"] > 70 and last["MACD"] < last["Signal"] and last["Close"] < last["EMA20"]:
-            return "❌ SELL"
+            return "❌ SELL", None
         else:
-            return "⏳ HOLD"
+            return "⏳ HOLD", None
     except Exception:
-        return "⚠️ Error Indicators"
+        return "⚠️ Error", None
 
-# --- Cek jam WIB ---
+# --- Timezone Jakarta ---
 wib = pytz.timezone("Asia/Jakarta")
 now = datetime.now(wib)
 st.caption(f"⏰ Sekarang: {now.strftime('%Y-%m-%d %H:%M:%S')} WIB")
 
-# --- Tombol refresh manual ---
-if st.button("🔄 Refresh Sekarang"):
-    st.cache_data.clear()
+# --- Input pencarian ticker ---
+st.title("📊 Indonesia Stock Analyzer (All IDX Stocks)")
+ticker_input = st.text_input("Masukkan kode saham (contoh: BBCA, BBRI, TLKM):")
 
-# --- Auto-refresh harian (setiap habis market close jam 17:00 WIB) ---
-if now.hour >= 17:
-    st.cache_data.clear()
-
-# --- Jalankan analisis ---
-st.title("📊 LQ45 Multi-Stock Analyzer (Auto Refresh Daily)")
-
-results = []
-for ticker in LQ45:
-    df = get_data(ticker)
+if ticker_input:
+    df = get_data(ticker_input)
     df = add_indicators(df)
-    signal = generate_signal(df)
-    results.append({"Ticker": ticker, "Signal": signal})
+    signal, est_buy = generate_signal(df)
 
-df_results = pd.DataFrame(results)
+    if df is not None:
+        st.subheader(f"📈 Analisis {ticker_input.upper()}.JK")
+        last = df.iloc[-1]
+        st.write(f"""
+        - Harga Close: **Rp {last['Close']:.2f}**
+        - RSI(14): **{last['RSI']:.2f}**
+        - EMA20: **Rp {last['EMA20']:.2f}**
+        - Signal: {signal}
+        """)
 
-# Tampilkan tabel
-st.dataframe(df_results)
-
-# Filter rekomendasi beli
-st.subheader("📌 Rekomendasi Beli")
-st.dataframe(df_results[df_results["Signal"]=="✅ BUY"])
+        if est_buy:
+            st.success(f"💡 Estimasi harga beli besok pagi: **Rp {est_buy:.2f}**")
+    else:
+        st.error("⚠️ Data tidak ditemukan atau error indikator.")
