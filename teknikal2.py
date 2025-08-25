@@ -11,15 +11,28 @@ import time
 def add_indicators(df):
     try:
         df = df.copy()
-        if df.empty or "Close" not in df.columns:
+
+        # pastikan kolom Close ada
+        if "Close" not in df.columns:
             return None
 
+        # pastikan tipe data numerik
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df = df.dropna(subset=["Close"])
+
+        # kalau data terlalu pendek, skip
+        if len(df) < 50:
+            return None
+
+        # tambahkan indikator
         df["RSI"] = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
-        df["MACD"] = ta.trend.MACD(close=df["Close"]).macd()
-        df["Signal"] = ta.trend.MACD(close=df["Close"]).macd_signal()
+        macd_ind = ta.trend.MACD(close=df["Close"])
+        df["MACD"] = macd_ind.macd()
+        df["Signal"] = macd_ind.macd_signal()
         df["EMA20"] = ta.trend.EMAIndicator(close=df["Close"], window=20).ema_indicator()
         df["EMA50"] = ta.trend.EMAIndicator(close=df["Close"], window=50).ema_indicator()
-        return df
+
+        return df.dropna()
     except Exception as e:
         print(f"⚠️ Error add_indicators: {e}")
         return None
@@ -89,7 +102,7 @@ for i, ticker in enumerate(tickers):
             results.append({"Ticker": ticker, "Signal": "⚠️ No Data"})
         else:
             df = add_indicators(df)
-            if df is None:
+            if df is None or df.empty:
                 results.append({"Ticker": ticker, "Signal": "⚠️ Error Indicators"})
             else:
                 signal = analyze_signal(df)
