@@ -31,43 +31,50 @@ lq45 = [
 def analyze_stock(ticker):
     try:
         df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
+
         if df.empty:
             return None
 
-        # pastikan numeric 1D float
-        for col in ["Open","High","Low","Close","Adj Close","Volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Reset index untuk hilangkan multi-index
+        df = df.reset_index()
+
+        # Pastikan hanya ambil kolom yang penting
+        cols = ["Date","Open","High","Low","Close","Volume"]
+        df = df[cols].copy()
+
+        # Convert semua ke numeric
+        for col in ["Open","High","Low","Close","Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna()
         if df.empty:
             return None
 
-        # indikator teknikal
-        df['MA9'] = df['Close'].rolling(9).mean()
+        # indikator teknikal (pakai float series agar aman)
+        df["MA9"] = df["Close"].rolling(9).mean()
 
-        rsi_ind = ta.momentum.RSIIndicator(close=df['Close'].astype(float), window=14)
-        df['RSI'] = rsi_ind.rsi()
+        rsi_ind = ta.momentum.RSIIndicator(close=df["Close"].astype(float), window=14)
+        df["RSI"] = rsi_ind.rsi()
 
-        macd = ta.trend.MACD(close=df['Close'].astype(float))
-        df['MACD'] = macd.macd()
-        df['MACD_signal'] = macd.macd_signal()
+        macd = ta.trend.MACD(close=df["Close"].astype(float))
+        df["MACD"] = macd.macd()
+        df["MACD_signal"] = macd.macd_signal()
 
         atr = ta.volatility.AverageTrueRange(
-            high=df['High'].astype(float),
-            low=df['Low'].astype(float),
-            close=df['Close'].astype(float),
+            high=df["High"].astype(float),
+            low=df["Low"].astype(float),
+            close=df["Close"].astype(float),
             window=14
         )
-        df['ATR'] = atr.average_true_range()
+        df["ATR"] = atr.average_true_range()
 
         last = df.iloc[-1]
-        close = last['Close']
-        ma9 = last['MA9']
-        rsi = last['RSI']
-        macd_val = last['MACD']
-        sig = last['MACD_signal']
-        atr_val = last['ATR']
+        close = last["Close"]
+        ma9 = last["MA9"]
+        rsi = last["RSI"]
+        macd_val = last["MACD"]
+        sig = last["MACD_signal"]
+        atr_val = last["ATR"]
 
         entry = close
         tp = close + 1.5 * atr_val
@@ -93,8 +100,9 @@ def analyze_stock(ticker):
             "TP": round(tp,2),
             "SL": round(sl,2)
         }
+
     except Exception as e:
-        st.error(f"Error {ticker}: {e}")
+        st.error(f"⚠️ Error {ticker}: {e}")
         return None
 
 # ==============================
@@ -112,7 +120,7 @@ if results:
     df_results = pd.DataFrame(results)
     # urutkan BUY paling atas
     df_results = df_results.sort_values(
-        by=["Rekomendasi","RSI"], 
+        by=["Rekomendasi","RSI"],
         ascending=[False, True]
     ).reset_index(drop=True)
 
