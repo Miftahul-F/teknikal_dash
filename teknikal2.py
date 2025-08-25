@@ -1,217 +1,112 @@
+# teknikal2.py
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import pytz
-from datetime import datetime
+import yfinance as yf
+import ta
 
-# ----------------------------
-# Utils & Indicators (manual)
-# ----------------------------
-def ensure_jk(t):
-    t = t.strip().upper()
+st.set_page_config(page_title="Stock Analyzer", layout="wide")
+
+st.title("📊 Multi-Timeframe Stock Analyzer Pro")
+
+# ================================
+# Fungsi Fetch Data
+# ================================
+@st.cache_data(show_spinner=False, ttl=30*60)
+def fetch_ohlc(ticker_no_suffix: str):
+    """Download OHLCV, auto append .JK, fallback period kalau kosong."""
+    t = (ticker_no_suffix or "").strip().upper()
     if not t:
-        return ""
-    # Jika sudah ada suffix lain (AAPL, MSFT), biarkan
-    if "." in t:
-        return t
-    # Default ke .JK (IDX)
-    return f"{t}.JK"
+        return None, "Ticker kosong"
+    if not t.endswith(".JK"):
+        t += ".JK"
 
-def rsi_series(close: pd.Series, window: int = 14) -> pd.Series:
-    close = pd.to_numeric(close, errors="coerce")
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    # Wilder's smoothing
-    avg_gain = gain.ewm(alpha=1/window, min_periods=window, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/window, min_periods=window, adjust=False).mean()
-    rs = avg_gain / (avg_loss.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    for period in ["6mo", "1y", "2y"]:
+        try:
+            df = yf.download(
+                t, period=period, interval="1d",
+                auto_adjust=True, progress=False
+            )
+        except Exception as e:
+            return None, f"Download error: {e}"
 
-def ema(close: pd.Series, window: int = 20) -> pd.Series:
-    close = pd.to_numeric(close, errors="coerce")
-    return close.ewm(span=window, adjust=False).mean()
+        if df is not None and not df.empty:
+            # pastikan numeric
+            for c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["Close"])
+            if not df.empty:
+                return df, None
 
-def macd_series(close: pd.Series, fast=12, slow=26, signal=9):
-    close = pd.to_numeric(close, errors="coerce")
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    macd_signal = macd.ewm(span=signal, adjust=False).mean()
-    hist = macd - macd_signal
-    return macd, macd_signal, hist
+    return None, f"Tidak ada data untuk {t}"
 
-def safe_download(ticker: str, period="6mo", interval="1d"):
-    try:
-        df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
-        if df is None or df.empty or "Close" not in df.columns:
-            return None
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df.dropna(subset=["Close"], inplace=True)
-        return df
-    except Exception:
-        return None
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+# ================================
+# Fungsi Tambah Indikator
+# ================================
+def add_indicators(df: pd.DataFrame):
     if df is None or df.empty:
         return None
-    out = df.copy()
-    out["EMA20"] = ema(out["Close"], 20)
-    out["RSI14"] = rsi_series(out["Close"], 14)
-    macd, sig, hist = macd_series(out["Close"], 12, 26, 9)
-    out["MACD"] = macd
-    out["MACD_sig"] = sig
-    out["MACD_hist"] = hist
-    return out.dropna(subset=["Close"])
-
-def generate_signal_row(last):
-    """
-    Rule sederhana:
-    - BUY: RSI < 60, Close > EMA20, MACD > Signal
-    - SELL: RSI > 70 dan Close < EMA20 dan MACD < Signal
-    - lainnya: HOLD
-    Sekaligus kasih EstBuy = Close * 1.01 (estimasi gap kecil open besok).
-    """
     try:
-        c = float(last["Close"])
-        rsi = float(last["RSI14"])
-        ema20 = float(last["EMA20"])
-        macd = float(last["MACD"])
-        sig = float(last["MACD_sig"])
-    except Exception:
-        return "⚠️ Error", None, 0.0
+        df["RSI14"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+        macd = ta.trend.MACD(df["Close"])
+        df["MACD"] = macd.macd()
+        df["MACD_SIGNAL"] = macd.macd_signal()
+        df["MA20"] = df["Close"].rolling(20).mean()
+        df["MA50"] = df["Close"].rolling(50).mean()
+    except Exception as e:
+        st.warning(f"⚠️ Gagal hitung indikator: {e}")
+        return None
+    return df
 
-    if (rsi < 60) and (c > ema20) and (macd > sig):
-        est = round(c * 1.01, 2)
-        conf = 0.9
-        # tambah confidence sedikit jika jarak MACD ke signal besar dan RSI antara 45-55 (momentum baru jalan)
-        conf += min(max((macd - sig) / max(abs(sig), 1e-6) * 0.1, 0), 0.05)
-        if 45 <= rsi <= 55:
-            conf += 0.03
-        conf = min(conf, 0.98)
-        return "✅ BUY", est, conf
-    elif (rsi > 70) and (c < ema20) and (macd < sig):
-        return "❌ SELL", None, 0.85
-    else:
-        # HOLD — hitung confidence sedang
-        conf = 0.5
-        if c > ema20: conf += 0.1
-        if macd > sig: conf += 0.1
-        if 40 <= rsi <= 60: conf += 0.05
-        conf = min(conf, 0.8)
-        return "⏳ HOLD", None, conf
+# ================================
+# UI Input
+# ================================
+st.sidebar.header("⚙️ Pengaturan Analisis")
+ticker = st.sidebar.text_input("Ticker (contoh: BBCA atau AAPL)", value="BBCA")
+avg_buy = st.sidebar.number_input("Avg Buy (Rp per lembar)", value=0.0)
+lot = st.sidebar.number_input("Jumlah lot (1 lot = 100 lembar)", value=0)
 
-# ----------------------------
-# UI
-# ----------------------------
-st.set_page_config(page_title="📋 IDX Watchlist Analyzer", layout="wide")
-st.title("📋 IDX Watchlist Analyzer — Multi Ticker (tanpa .JK)")
-
-wib = pytz.timezone("Asia/Jakarta")
-now = datetime.now(wib)
-st.caption(f"⏰ {now.strftime('%Y-%m-%d %H:%M:%S')} WIB — data harian Yahoo Finance (delay ~15m)")
-
-with st.sidebar:
-    st.subheader("Input Watchlist")
-    st.caption("Pisahkan dengan spasi, koma, atau baris baru. Contoh: `BBCA BBRI TLKM ADRO`")
-    raw = st.text_area("Kode saham", value="BBCA BBRI TLKM ADRO")
-    period = st.selectbox("Period data", ["3mo", "6mo", "1y", "2y"], index=1)
-    st.caption("Estimasi harga beli besok = Close hari ini × 1.01 (bisa diganti cepat di kode).")
-
-# Parse tickers
-tokens = [t.strip().upper() for t in (raw.replace(",", " ").split()) if t.strip()]
-tickers = [ensure_jk(t) for t in tokens]
-tickers = [t for t in tickers if t]  # remove empty
-
-if not tickers:
-    st.info("Masukkan minimal satu kode saham.")
-    st.stop()
-
-rows = []
-error_list = []
-
-progress = st.progress(0)
-for i, tk in enumerate(tickers, start=1):
-    progress.progress(i / len(tickers))
-    df = safe_download(tk, period=period, interval="1d")
-    if df is None or df.empty:
-        error_list.append(f"{tk}: data kosong")
-        rows.append({"Ticker": tk, "Signal": "⚠️ No Data", "Close": np.nan, "RSI14": np.nan,
-                     "EMA20": np.nan, "MACD": np.nan, "EstBuyTomorrow": None, "Confidence": 0.0})
-        continue
-
-    dfi = add_indicators(df)
-    if dfi is None or dfi.empty:
-        error_list.append(f"{tk}: indikator gagal")
-        rows.append({"Ticker": tk, "Signal": "⚠️ Error", "Close": float(df["Close"].iloc[-1]),
-                     "RSI14": np.nan, "EMA20": np.nan, "MACD": np.nan,
-                     "EstBuyTomorrow": None, "Confidence": 0.0})
-        continue
-
-    last = dfi.iloc[-1]
-    sig, est, conf = generate_signal_row(last)
-    rows.append({
-        "Ticker": tk,
-        "Signal": sig,
-        "Close": float(last["Close"]),
-        "RSI14": float(last["RSI14"]),
-        "EMA20": float(last["EMA20"]),
-        "MACD": float(last["MACD"]),
-        "EstBuyTomorrow": est,
-        "Confidence": round(float(conf), 2)
-    })
-
-progress.progress(1.0)
-
-# Tabel ringkas
-df_res = pd.DataFrame(rows)
-order = {"✅ BUY": 0, "⏳ HOLD": 1, "❌ SELL": 2, "⚠️ No Data": 3, "⚠️ Error": 4}
-df_res["_ord"] = df_res["Signal"].map(order).fillna(9)
-df_res = df_res.sort_values(by=["_ord", "Confidence", "Ticker"], ascending=[True, False, True]).drop(columns="_ord")
-
-st.subheader("📜 Hasil Sinyal Watchlist")
-st.dataframe(
-    df_res.astype({
-        "Close": "float64",
-        "RSI14": "float64",
-        "EMA20": "float64",
-        "MACD": "float64",
-        "Confidence": "float64"
-    }),
-    use_container_width=True
-)
-
-# Rekomendasi BUY (jika ada)
-df_buy = df_res[df_res["Signal"] == "✅ BUY"].copy()
-if not df_buy.empty:
-    st.success("🎯 Rekomendasi BUY untuk besok pagi (estimasi):")
-    st.dataframe(df_buy[["Ticker", "Close", "EstBuyTomorrow", "Confidence"]], use_container_width=True)
+# ================================
+# Main App
+# ================================
+df, err = fetch_ohlc(ticker)
+if err:
+    st.error(err)
+elif df is None or df.empty:
+    st.warning("⚠️ Data tidak ditemukan.")
 else:
-    st.info("Belum ada sinyal BUY kuat hari ini.")
+    df = add_indicators(df)
 
-# Detail tiap ticker
-st.markdown("---")
-st.subheader("🔍 Detail per Ticker")
-for _, row in df_res.iterrows():
-    with st.expander(f"{row['Ticker']} • {row['Signal']} • Close {row['Close']:.2f} • Conf {row['Confidence']:.2f}"):
-        tk = row["Ticker"]
-        df = safe_download(tk, period=period, interval="1d")
-        dfi = add_indicators(df) if df is not None else None
-        if dfi is None or dfi.empty:
-            st.warning("Data/indikator tidak tersedia.")
-            continue
+    if df is not None:
+        st.subheader(f"📈 Grafik & Analisis — {ticker.upper()}.JK")
+        st.line_chart(df[["Close", "MA20", "MA50"]])
 
-        last = dfi.iloc[-1]
-        st.write(
-            f"- RSI(14): **{last['RSI14']:.2f}**  •  EMA20: **{last['EMA20']:.2f}**  •  MACD/Signal: **{last['MACD']:.4f}/{last['MACD_sig']:.4f}**"
-        )
-        if not pd.isna(row["EstBuyTomorrow"]):
-            st.write(f"- 💡 Estimasi beli besok: **{row['EstBuyTomorrow']:.2f}**")
+        latest = df.iloc[-1]
+        st.write("### 📊 Ringkasan Hari Ini")
+        st.write(f"📅 Tanggal: {latest.name.date()}")
+        st.write(f"💰 Close: {latest['Close']:.2f}")
+        st.write(f"📈 RSI(14): {latest['RSI14']:.2f}")
+        st.write(f"📉 MACD: {latest['MACD']:.2f} | Signal: {latest['MACD_SIGNAL']:.2f}")
 
-        # mini chart
-        chart_df = dfi[["Close", "EMA20"]].tail(120)
-        st.line_chart(chart_df, height=220)
+        if avg_buy > 0 and lot > 0:
+            total_buy = avg_buy * lot * 100
+            total_now = latest["Close"] * lot * 100
+            profit = total_now - total_buy
+            st.write(f"💼 Estimasi nilai portofolio: Rp {total_now:,.0f}")
+            st.write(f"📊 Profit/Loss: Rp {profit:,.0f}")
+
+        # rekomendasi sederhana
+        rec = "⏳ Tahan"
+        if latest["RSI14"] < 30:
+            rec = "✅ Potensi Beli (Oversold)"
+        elif latest["RSI14"] > 70:
+            rec = "⚠️ Potensi Jual (Overbought)"
+        elif latest["MACD"] > latest["MACD_SIGNAL"]:
+            rec = "📈 Momentum Naik"
+        elif latest["MACD"] < latest["MACD_SIGNAL"]:
+            rec = "📉 Momentum Turun"
+
+        st.success(f"📌 Rekomendasi besok pagi: {rec}")
+
+        with st.expander("📜 Data Tabel"):
+            st.dataframe(df.tail(30))
